@@ -1,4 +1,10 @@
 # ESP-NOW 遥控器接收与串口透传工程
+RoboCon遥控器连接
+Stm32数据采集 https://gitee.com/syy6688/cqu-remote-control.git
+ESP32C5 接收Stm32 通过espnow发送数据 https://github.com/ConQUcode/Remote_espc5.git
+ESP32S3 接收esp32c5 数据 通过串口发送数据到主控 https://github.com/ConQUcode/Remote_esp32s3.git
+主控代码 https://github.com/ConQUcode/STM32H743VIT6.git
+
 
 本工程运行在 ESP32-S3 开发板上，用作遥控器数据接收模块。ESP32-S3 通过 ESP-NOW 协议接收遥控器发送的 18 字节控制数据帧，完成基础帧校验后，将原始数据帧通过 UART1 发送给 H7 主控，由 H7 继续完成上层控制逻辑解析与执行。
 
