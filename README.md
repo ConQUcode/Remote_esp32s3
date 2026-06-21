@@ -125,12 +125,59 @@ monitor_speed = 115200
 常用命令：
 
 ```bash
-pio run
-pio run -t upload
-pio device monitor -b 115200
+pio run -e esp32-s3-devkitc-1
+pio run -e esp32-s3-devkitc-1 -t upload
+pio device monitor -e esp32-s3-devkitc-1 -b 115200
 ```
 
 如果使用 ESP-IDF 命令行，也可以根据本地 ESP-IDF 环境执行对应的 build、flash 和 monitor 流程。
+
+当前通过 `main/receiver_main.c` 顶部的宏选择输入功能：
+
+```c
+// 0 = 原 ESP-NOW 接收模式
+// 1 = 手机 WiFi 网页模拟遥控器模式
+#define REMOTE_INPUT_MODE_WIFI 1
+```
+
+| 宏值 | 功能 |
+| --- | --- |
+| `0` | 原 ESP-NOW 接收功能，接收遥控器/ESP32C5 发来的 18 字节数据帧并透传到 UART1 |
+| `1` | 手机 WiFi 模拟遥控器功能，ESP32-S3 开热点和网页，手机网页生成同协议 18 字节帧并透传到 UART1 |
+
+## 手机 WiFi 模拟遥控器模式
+
+当暂时没有 ESP32C5 发送端、无法使用实体遥控器链路时，可以把 `REMOTE_INPUT_MODE_WIFI` 改为 `1` 后重新编译烧录。该模式不会改变 H7 侧协议：网页操作会在 ESP32-S3 内部生成同样的 18 字节遥控器数据帧，然后继续通过 UART1 原样发送给 H7。
+
+手机使用方法：
+
+1. 确认 `main/receiver_main.c` 中 `#define REMOTE_INPUT_MODE_WIFI 1`。
+2. 编译并烧录 `esp32-s3-devkitc-1` 环境固件。
+3. 手机连接 WiFi 热点 `ESP32S3-Remote`，密码 `12345678`。
+4. 浏览器打开 `http://192.168.4.1/`。
+5. 页面上的左右摇杆、拨轮、左右开关和 K0-K3 按键会映射到原 18 字节协议字段。
+
+原 ESP-NOW 接收模式使用方法：
+
+1. 把 `main/receiver_main.c` 中的宏改为 `#define REMOTE_INPUT_MODE_WIFI 0`。
+2. 重新编译并烧录 `esp32-s3-devkitc-1` 环境固件。
+
+生成帧格式保持不变：
+
+```text
+0      : 0xAA
+1..4   : keys[0..3]
+5..6   : left_x, big-endian int16
+7..8   : left_y, big-endian int16
+9..10  : right_x, big-endian int16
+11..12 : right_y, big-endian int16
+13..14 : dial, big-endian int16
+15     : switch_left
+16     : switch_right
+17     : 0x55
+```
+
+切换模式只需要改 `REMOTE_INPUT_MODE_WIFI` 的值并重新烧录，不需要切换 PlatformIO 环境。
 
 ## 启动日志
 
@@ -149,7 +196,7 @@ ESP-NOW Receiver started. Listening on Channel 3...
 ## 关键源码位置
 
 - `main/receiver_main.c`：当前实际编译的接收端主程序，包含 WiFi、ESP-NOW、UART 初始化和接收回调。
-- `main/CMakeLists.txt`：组件源文件注册，目前只编译 `receiver_main.c`。
+- `main/CMakeLists.txt`：组件源文件注册，目前只编译 `receiver_main.c`，并声明 WiFi 网页模式需要的 `esp_http_server` 组件。
 - `platformio.ini`：PlatformIO 工程和 ESP32-S3 开发板配置。
 - `RECEIVER_GUIDE.md`：早期接收端适配说明，可作为协议背景参考。
 
