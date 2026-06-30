@@ -1,94 +1,157 @@
 # 接收端 (Receiver) 开发与适配指南
 
-基于发送端协议文档 (`PROTOCOL.md`)，当前的官方 ESP-NOW 示例工程需要进行针对性修改才能正确接收和解析遥控器发送的数据。
+本文档用于说明当前 `espnow` 工程的接收端中转逻辑。当前实际编译入口不是官方示例文件，而是：
 
-## 1. 当前工程现状分析
+- `main/receiver_main.c`
+- `main/CMakeLists.txt`
 
-当前的官方 `espnow` 工程**无法直接处理**遥控器发来的数据。原因如下：
-1. **数据包格式不匹配**：官方示例使用的是自定义的 `example_espnow_data_t` 结构体，内部包含了大量的额外校验字段（CRC、通信状态、魔数 Magic 等），并期望在接收端验证这些字段。而遥控器发来的是非常精简的 18 字节控制指令帧。
-2. **连接逻辑不同**：官方示例包含了一套通过广播互相发现并记忆 MAC 地址的握手流程；而本协议倾向于“发送端预先写入接收端 MAC 地址”的单向或点对点简单通信。
-3. **信道设置**：官方示例的信道是由 Menuconfig 配置的，而遥控器强制要求必须在 **Channel 3**。
+`main/CMakeLists.txt` 目前只注册 `receiver_main.c`，因此 `main/espnow_example_main.c` 只是遗留参考文件，不能作为当前功能修改依据。
 
----
+## 1. 当前工程角色
 
-## 2. 接收端代码改造指南
+本工程运行在 ESP32-S3 上，负责把上位机/发送端通过 ESP-NOW 发来的遥控器 payload 转发给 H7 主控：
 
-为了使当前工程适配遥控器，需要在 `main/espnow_example_main.c` 中进行以下改造：
-
-### 2.1 锁定物理信道 (Channel 3)
-在 WiFi 初始化完成后（例如在 `example_wifi_init` 之后），强制将信道固定为 3，以匹配遥控器：
-```c
-// 强制设置 WiFi 工作在信道 3
-ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
-ESP_ERROR_CHECK(esp_wifi_set_channel(3, WIFI_SECOND_CHAN_NONE));
-ESP_ERROR_CHECK(esp_wifi_set_promiscuous(false));
+```text
+遥控器 / STM32 采集端
+    |
+    | UART1, 115200 8N1
+    v
+ESP32-S3 发送端
+    |
+    | ESP-NOW, Channel 3
+    v
+ESP32-S3 接收端，本工程
+    |
+    | UART1, 115200 8N1
+    v
+H7 主控
 ```
 
-### 2.2 定义接收数据结构体
-在代码中定义与 `PROTOCOL.md` 严格对应的结构体和解析函数，方便提取摇杆和按键数据。
+ESP32-S3 接收端不重新封包、不改变字段顺序、不改变大小端，只在收到合法 payload 后通过 UART1 原样写出。
+
+## 2. 输入模式宏
+
+当前通过 `main/receiver_main.c` 顶部宏选择输入模式：
+
 ```c
-// 大端序转小端序 (ESP32 是小端序)
+// 0 = 原 ESP-NOW 接收/中转模式，透传 18 字节主帧和 3 字节控制帧
+// 1 = 手机 WiFi 网页模拟遥控器模式，网页生成 18 字节主帧
+#define REMOTE_INPUT_MODE_WIFI 0
+```
+
+| 宏值 | 功能 |
+| --- | --- |
+| `0` | 原 ESP-NOW 接收/中转模式，接收发送端 payload 并透传到 H7 |
+| `1` | 手机 WiFi 网页模拟遥控器模式，ESP32-S3 开热点，网页生成 18 字节主帧并透传到 H7 |
+
+如果要测试当前遥控器中转链路，需要把该宏改为 `0` 后重新编译烧录。
+
+## 3. ESP-NOW 中转模式
+
+ESP-NOW 中转模式的关键配置如下：
+
+| 配置项 | 当前值 |
+| --- | --- |
+| WiFi 模式 | `WIFI_MODE_STA` |
+| 固定信道 | Channel 3 |
+| 固定 STA MAC | `1a:2b:3c:4d:5e:6f` |
+| ESP-NOW | 只注册接收回调，不主动发送遥控数据 |
+| UART 外设 | `UART_NUM_1` |
+| UART 波特率 | `115200` |
+| ESP32-S3 TX | GPIO17，连接 H7 RX |
+| ESP32-S3 RX | GPIO16，连接 H7 TX，当前未主动解析 H7 回传 |
+
+固定 MAC 在 `wifi_init()` 中设置：
+
+```c
+uint8_t custom_mac[6] = {0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F};
+ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, custom_mac));
+```
+
+发送端 `dest_mac` 必须与这里一致，发送端和接收端也必须都锁定在 Channel 3。
+
+## 4. 当前 payload 协议
+
+根据发送端 `DATA_PROTOCOL.md` 和 `main/softap_example_main.c`，接收端需要支持两类 ESP-NOW payload：
+
+| Payload 长度 | 内容 | 用途 | 接收端行为 |
+| ---: | --- | --- | --- |
+| `18` | `AA ... 55` | 遥控器主数据帧 | 校验包头/包尾，通过 UART1 原样透传 18 字节 |
+| `3` | `AA A1 A2` | 控制/重连命令 | 校验 3 个固定字节，通过 UART1 原样透传 3 字节 |
+
+旧逻辑如果只写 `len == 18` 分支，会把 `AA A1 A2` 当作未知包丢弃，导致上位机新增控制/重连命令无法到达 H7。
+
+## 5. 18 字节主数据帧
+
+主数据帧结构如下：
+
+| 偏移量 | 字段 | 长度 | 说明 |
+| --- | --- | --- | --- |
+| `0` | `header` | 1 字节 | 固定 `0xAA` |
+| `1~4` | `keys[4]` | 4 字节 | 按键状态原始数据 |
+| `5~6` | `rocker_l_x` | 2 字节 | 左摇杆 X，大端序 |
+| `7~8` | `rocker_l_y` | 2 字节 | 左摇杆 Y，大端序 |
+| `9~10` | `rocker_r_x` | 2 字节 | 右摇杆 X，大端序 |
+| `11~12` | `rocker_r_y` | 2 字节 | 右摇杆 Y，大端序 |
+| `13~14` | `dial` | 2 字节 | 拨轮，大端序 |
+| `15` | `switch_left` | 1 字节 | 左侧开关状态 |
+| `16` | `switch_right` | 1 字节 | 右侧开关状态 |
+| `17` | `footer` | 1 字节 | 固定 `0x55` |
+
+ESP32-S3 是小端序 MCU，调试解析时需要用 `be16_to_i16()` 把 16 位字段从大端序转换为本地 `int16_t`：
+
+```c
 static inline int16_t be16_to_i16(const uint8_t *p) {
     return (int16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
-
-// 遥控器数据帧结构 (18 Bytes)
-typedef struct {
-    uint8_t header;         // 固定 0xAA
-    uint8_t keys[4];        // 4字节按键状态
-    uint8_t rocker_l_x[2];  // 左摇杆X (大端)
-    uint8_t rocker_l_y[2];  // 左摇杆Y (大端)
-    uint8_t rocker_r_x[2];  // 右摇杆X (大端)
-    uint8_t rocker_r_y[2];  // 右摇杆Y (大端)
-    uint8_t dial[2];        // 拨轮 (大端)
-    uint8_t switch_left;    // 左开关
-    uint8_t switch_right;   // 右开关
-    uint8_t footer;         // 固定 0x55
-} __attribute__((packed)) remote_data_t;
 ```
 
-### 2.3 重写 ESP-NOW 接收回调函数
-将原本复杂的 `example_espnow_recv_cb` 替换为专门解析遥控器数据的精简版本：
+这个转换只用于日志和调试识别。实际发给 H7 的仍是原始字节，不会改成小端序。
+
+## 6. 当前接收回调处理
+
+`espnow_recv_cb()` 当前按长度和固定字节区分 payload：
+
 ```c
-static void example_espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
-{
-    // 判断长度是否为 18 字节，并且包头为 0xAA，包尾为 0x55
-    if (len == 18 && data[0] == 0xAA && data[17] == 0x55) {
-        remote_data_t *remote_data = (remote_data_t *)data;
-        
-        // 解析摇杆数据 (处理大小端转换)
-        int16_t left_x  = be16_to_i16(remote_data->rocker_l_x);
-        int16_t left_y  = be16_to_i16(remote_data->rocker_l_y);
-        int16_t right_x = be16_to_i16(remote_data->rocker_r_x);
-        int16_t right_y = be16_to_i16(remote_data->rocker_r_y);
-        int16_t dial    = be16_to_i16(remote_data->dial);
-        
-        ESP_LOGI("RECV", "Left Rocker: X=%d, Y=%d | Switches: L=%d, R=%d", 
-                 left_x, left_y, remote_data->switch_left, remote_data->switch_right);
-                 
-        // 在这里添加将解析后的数据传递给电机/飞控控制逻辑的代码
-    } else {
-        ESP_LOGW("RECV", "Received unknown packet, len: %d", len);
-    }
+if (is_valid_remote_frame(data, len)) {
+    forward_remote_payload(data, len);
+} else if (is_valid_control_frame(data, len)) {
+    forward_remote_payload(data, len);
+} else {
+    ESP_LOGW(TAG, "Unknown packet ...");
 }
 ```
 
-### 2.4 获取并记录接收端的 MAC 地址
-为了让发送端能够定向发送（填入 `dest_mac`），接收端必须知道自己的 MAC 地址。在 `app_main` 中读取并打印出来：
+`forward_remote_payload()` 会再次确认 payload 合法，然后调用：
+
 ```c
-uint8_t mac[6];
-esp_read_mac(mac, ESP_MAC_WIFI_STA);
-ESP_LOGI("MAC", "Receiver MAC Address: %02x:%02x:%02x:%02x:%02x:%02x", 
-         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+uart_write_bytes(UART_PORT_NUM, data, len);
 ```
 
----
+因此 H7 端需要能同时识别：
 
-## 3. 下一步建议工作
+- 18 字节 `AA ... 55` 遥控器主数据帧
+- 3 字节 `AA A1 A2` 控制/重连命令
 
-由于官方的 ESP-NOW 示例附带了大量不需要的广播配对逻辑，建议对 `espnow_example_main.c` 进行**大瘦身**。
-您可以：
-1. 删除 `example_espnow_send_cb`（接收端不需要发送回调）。
-2. 删除 `example_espnow_task` 和相关的队列传输（接收控制信号通常需要低延迟，可以直接在接收回调中或者单独的专用高频控制任务中处理）。
-3. 只保留 WiFi 初始化、ESP-NOW 初始化、以及注册接收回调函数的骨架。
+H7 主控端的具体串口解包说明见 `H7_UART_UNPACK_GUIDE.md`。
 
+## 7. 手机 WiFi 模拟遥控器模式
+
+当 `REMOTE_INPUT_MODE_WIFI` 为 `1` 时，ESP32-S3 开启热点和网页：
+
+| 配置项 | 当前值 |
+| --- | --- |
+| 热点 SSID | `ESP32S3-Remote` |
+| 热点密码 | `12345678` |
+| 访问地址 | `http://192.168.4.1/` |
+
+网页会生成同协议的 18 字节主数据帧，并通过 UART1 发给 H7。该模式用于临时没有实体遥控器/ESP-NOW 发送端时的手动调试，不会生成 `AA A1 A2` 控制帧。
+
+## 8. 适配检查清单
+
+1. 确认 `main/CMakeLists.txt` 仍然只编译 `receiver_main.c`。
+2. 如需使用 ESP-NOW 中转链路，确认 `REMOTE_INPUT_MODE_WIFI` 为 `0`。
+3. 确认发送端 `dest_mac` 等于接收端固定 STA MAC：`1a:2b:3c:4d:5e:6f`。
+4. 确认发送端和接收端都使用 Channel 3。
+5. 确认 H7 UART 配置为 `115200 8N1`，H7 RX 接 ESP32-S3 GPIO17。
+6. 确认 H7 协议层同时支持 18 字节主帧和 3 字节 `AA A1 A2` 控制帧。

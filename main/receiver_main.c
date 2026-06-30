@@ -17,9 +17,9 @@
 #define TAG "RECEIVER"
 
 // 功能选择宏：
-// 0 = 原 ESP-NOW 接收模式
-// 1 = 手机 WiFi 网页模拟遥控器模式
-#define REMOTE_INPUT_MODE_WIFI 1
+// 0 = 原 ESP-NOW 接收/中转模式，透传 18 字节主帧和 3 字节控制帧
+// 1 = 手机 WiFi 网页模拟遥控器模式，网页生成 18 字节主帧
+#define REMOTE_INPUT_MODE_WIFI 0
 
 // 定义串口透传的引脚和配置
 #define UART_PORT_NUM      UART_NUM_1
@@ -28,8 +28,11 @@
 #define UART_BAUD_RATE     115200
 
 #define REMOTE_FRAME_LEN    18
+#define CONTROL_FRAME_LEN   3
 #define REMOTE_FRAME_HEADER 0xAA
 #define REMOTE_FRAME_FOOTER 0x55
+#define CONTROL_FRAME_BYTE1 0xA1
+#define CONTROL_FRAME_BYTE2 0xA2
 #define WIFI_CHANNEL        3
 
 // 遥控器数据帧结构 (18 Bytes)
@@ -63,18 +66,35 @@ static bool is_valid_remote_frame(const uint8_t *data, int len) {
            data[REMOTE_FRAME_LEN - 1] == REMOTE_FRAME_FOOTER;
 }
 
-static void forward_remote_frame(const uint8_t *data, int len) {
-    if (!is_valid_remote_frame(data, len)) {
-        ESP_LOGW(TAG, "Drop invalid remote frame, len: %d", len);
+static bool is_valid_control_frame(const uint8_t *data, int len) {
+    return data != NULL &&
+           len == CONTROL_FRAME_LEN &&
+           data[0] == REMOTE_FRAME_HEADER &&
+           data[1] == CONTROL_FRAME_BYTE1 &&
+           data[2] == CONTROL_FRAME_BYTE2;
+}
+
+static bool is_valid_passthrough_payload(const uint8_t *data, int len) {
+    return is_valid_remote_frame(data, len) || is_valid_control_frame(data, len);
+}
+
+static void forward_remote_payload(const uint8_t *data, int len) {
+    if (!is_valid_passthrough_payload(data, len)) {
+        ESP_LOGW(TAG, "Drop invalid remote payload, len: %d", len);
         return;
     }
 
-    uart_write_bytes(UART_PORT_NUM, data, len);
+    int written = uart_write_bytes(UART_PORT_NUM, data, len);
+    if (written != len) {
+        ESP_LOGW(TAG, "UART forward incomplete, len:%d written:%d", len, written);
+    }
 }
 
 #if !REMOTE_INPUT_MODE_WIFI
 // 接收回调函数
 static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
+    (void)recv_info;
+
     if (is_valid_remote_frame(data, len)) {
         remote_data_t *remote = (remote_data_t *)data;
         
@@ -84,11 +104,16 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
         int16_t right_y = be16_to_i16(remote->rocker_r_y);
         int16_t dial    = be16_to_i16(remote->dial);
         
-        // 打印解析出来的数据
-       // ESP_LOGI(TAG, "L_JOY:(%5d, %5d) | R_JOY:(%5d, %5d) | DIAL:%5d | SW:(L:%d R:%d)", 
-                // left_x, left_y, right_x, right_y, dial, remote->switch_left, remote->switch_right);
+        ESP_LOGI(TAG,
+                 "ESP-NOW RX remote: KEY=%02X%02X%02X%02X L(%d,%d) R(%d,%d) dial=%d SW(%u,%u)",
+                 remote->keys[0], remote->keys[1], remote->keys[2], remote->keys[3],
+                 (int)left_x, (int)left_y, (int)right_x, (int)right_y, (int)dial,
+                 (unsigned int)remote->switch_left, (unsigned int)remote->switch_right);
                  
-        forward_remote_frame(data, len);
+        forward_remote_payload(data, len);
+    } else if (is_valid_control_frame(data, len)) {
+        ESP_LOGI(TAG, "ESP-NOW RX control frame: AA A1 A2");
+        forward_remote_payload(data, len);
     } else {
         uint8_t header = (data != NULL && len > 0) ? data[0] : 0;
         uint8_t footer = (data != NULL && len > 0) ? data[len - 1] : 0;
@@ -228,7 +253,7 @@ static esp_err_t control_handler(httpd_req_t *req) {
     frame[16] = get_query_u8(req, "swr", 0);
     frame[17] = REMOTE_FRAME_FOOTER;
 
-    forward_remote_frame(frame, REMOTE_FRAME_LEN);
+    forward_remote_payload(frame, REMOTE_FRAME_LEN);
 
     httpd_resp_set_type(req, "text/plain");
     return httpd_resp_sendstr(req, "ok");
